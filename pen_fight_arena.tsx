@@ -31,6 +31,7 @@ import {
 
 declare const __app_id: string | undefined;
 declare const __firebase_config: string | undefined;
+declare const __vite_firebase_config: string | undefined;
 declare const __initial_auth_token: string | undefined;
 
 // ============================================================================
@@ -39,17 +40,26 @@ declare const __initial_auth_token: string | undefined;
 let app: any = null;
 let auth: any = null;
 let db: any = null;
+let firebaseInitializationError: string | null = null;
 const appId = typeof __app_id !== 'undefined' ? __app_id : 'pen-fight-arena-app';
 
 try {
-  if (typeof __firebase_config !== 'undefined' && __firebase_config) {
-    const firebaseConfig = JSON.parse(__firebase_config);
+  const firebaseConfigText =
+    typeof __firebase_config !== 'undefined' && __firebase_config
+      ? __firebase_config
+      : typeof __vite_firebase_config !== 'undefined'
+      ? __vite_firebase_config
+      : '';
+  if (firebaseConfigText) {
+    const firebaseConfig = JSON.parse(firebaseConfigText);
     app = initializeApp(firebaseConfig);
     auth = getAuth(app);
     db = getFirestore(app);
   }
 } catch (err) {
-  console.warn('Firebase initialization skipped or unavailable:', err);
+  firebaseInitializationError =
+    'Firebase configuration is invalid. Check VITE_FIREBASE_CONFIG in your environment.';
+  console.error('Firebase initialization failed:', err);
 }
 
 // ============================================================================
@@ -1685,6 +1695,8 @@ export default function App() {
   const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
 
   const [user, setUser] = useState<User | null>(null);
+  const [firebaseAuthReady, setFirebaseAuthReady] = useState<boolean>(!auth);
+  const [firebaseAuthError, setFirebaseAuthError] = useState<string | null>(null);
   const [roomCodeInput, setRoomCodeInput] = useState<string>('');
   const [activeRoomCode, setActiveRoomCode] = useState<string>('');
   const [onlineRole, setOnlineRole] = useState<1 | 2 | 'spectator'>(1);
@@ -1833,11 +1845,28 @@ export default function App() {
           await signInAnonymously(auth);
         }
       } catch (e) {
-        console.warn('Firebase anonymous auth warning:', e);
+        console.error('Firebase authentication failed:', e);
+        setFirebaseAuthError(
+          'Could not sign in to Firebase. Enable Anonymous authentication in your Firebase project.'
+        );
       }
     };
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, (u) => setUser(u));
+    const unsubscribe = onAuthStateChanged(
+      auth,
+      (u) => {
+        setUser(u);
+        setFirebaseAuthReady(true);
+        if (u) setFirebaseAuthError(null);
+      },
+      (error) => {
+        console.error('Firebase authentication state failed:', error);
+        setFirebaseAuthReady(true);
+        setFirebaseAuthError(
+          'Could not sign in to Firebase. Enable Anonymous authentication in your Firebase project.'
+        );
+      }
+    );
     return () => unsubscribe();
   }, []);
 
@@ -2027,6 +2056,20 @@ export default function App() {
   // Create 6-Character Online Room
   const handleCreateOnlineRoom = async () => {
     setOnlineError(null);
+    if (!db || !auth) {
+      setOnlineError(
+        firebaseInitializationError ||
+          'Online rooms are not configured. Set VITE_FIREBASE_CONFIG to your Firebase web app configuration.'
+      );
+      return;
+    }
+    if (!firebaseAuthReady || !user) {
+      setOnlineError(
+        firebaseAuthError || 'Connecting to the online service. Please try again in a moment.'
+      );
+      return;
+    }
+
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
     for (let i = 0; i < 6; i++) {
@@ -2035,7 +2078,7 @@ export default function App() {
 
     const initialRoom: OnlineRoomState = {
       roomCode: code,
-      hostUid: user?.uid || 'local-host',
+      hostUid: user.uid,
       guestUid: null,
       hostName: profile.name,
       guestName: 'Waiting for Challenger...',
@@ -2057,20 +2100,22 @@ export default function App() {
       updatedAt: Date.now()
     };
 
+    try {
+      const roomDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'pen_fight_rooms', code);
+      await setDoc(roomDocRef, initialRoom);
+    } catch (e) {
+      console.error('Firebase room creation failed:', e);
+      setOnlineError(
+        'Could not create the online room. Check your Firebase Firestore database and security rules.'
+      );
+      return;
+    }
+
     setOnlineRole(1);
     setActiveRoomCode(code);
     setOnlineRoomData(initialRoom);
     setGameMode('online');
     unlockAchievement('ach-online-duel');
-
-    if (user && db) {
-      try {
-        const roomDocRef = doc(db, 'artifacts', appId, 'public', 'data', 'pen_fight_rooms', code);
-        await setDoc(roomDocRef, initialRoom);
-      } catch (e) {
-        console.warn('Cloud room creation fallback to local BroadcastChannel:', e);
-      }
-    }
     showToast(`Created Online Room ${code}! Share the code or open another tab.`);
   };
 
@@ -2082,56 +2127,69 @@ export default function App() {
       return;
     }
     setOnlineError(null);
-    unlockAchievement('ach-online-duel');
+    if (!db || !auth) {
+      setOnlineError(
+        firebaseInitializationError ||
+          'Online rooms are not configured. Set VITE_FIREBASE_CONFIG to your Firebase web app configuration.'
+      );
+      return;
+    }
+    if (!firebaseAuthReady || !user) {
+      setOnlineError(
+        firebaseAuthError || 'Connecting to the online service. Please try again in a moment.'
+      );
+      return;
+    }
+    try {
+      const roomDocRef = doc(
+        db,
+        'artifacts',
+        appId,
+        'public',
+        'data',
+        'pen_fight_rooms',
+        cleanCode
+      );
+      const snap = await getDoc(roomDocRef);
+      if (!snap.exists()) {
+        setOnlineError(`Room "${cleanCode}" not found. Check the 6-character code.`);
+        return;
+      }
+      const data = snap.data() as OnlineRoomState;
 
-    if (user && db) {
-      try {
-        const roomDocRef = doc(
-          db,
-          'artifacts',
-          appId,
-          'public',
-          'data',
-          'pen_fight_rooms',
-          cleanCode
-        );
-        const snap = await getDoc(roomDocRef);
-        if (!snap.exists()) {
-          setOnlineError(`Room "${cleanCode}" not found. Check the 6-character code.`);
-          return;
-        }
-        const data = snap.data() as OnlineRoomState;
-
-        if (asSpectator) {
-          setOnlineRole('spectator');
-          setActiveRoomCode(cleanCode);
-          setGameMode('online');
-          await updateDoc(roomDocRef, {
-            spectatorCount: (data.spectatorCount || 0) + 1,
-            updatedAt: Date.now()
-          });
-          startNewMatch('online', data.p1PenId, data.p2PenId, data.deskId, data.ruleMode);
-          return;
-        }
-
-        const isRejoiningHost = data.hostUid === user.uid && !dualViewTestMode;
-        const assignedRole: 1 | 2 = isRejoiningHost ? 1 : 2;
-        setOnlineRole(assignedRole);
-        setActiveRoomCode(cleanCode);
-        setGameMode('online');
-
+      if (asSpectator) {
         await updateDoc(roomDocRef, {
-          guestUid: user.uid,
-          guestName: profile.name === data.hostName ? `${profile.name}_P2` : profile.name,
-          p2PenId,
-          status: 'playing',
+          spectatorCount: (data.spectatorCount || 0) + 1,
           updatedAt: Date.now()
         });
-
-        startNewMatch('online', data.p1PenId, p2PenId, data.deskId, data.ruleMode);
-      } catch {
-        setOnlineError('Could not join room. Please check your connection.');
+        setOnlineRole('spectator');
+        setActiveRoomCode(cleanCode);
+        setGameMode('online');
+        unlockAchievement('ach-online-duel');
+        startNewMatch('online', data.p1PenId, data.p2PenId, data.deskId, data.ruleMode);
+        return;
       }
+
+      const isRejoiningHost = data.hostUid === user.uid && !dualViewTestMode;
+      const assignedRole: 1 | 2 = isRejoiningHost ? 1 : 2;
+      await updateDoc(roomDocRef, {
+        guestUid: user.uid,
+        guestName: profile.name === data.hostName ? `${profile.name}_P2` : profile.name,
+        p2PenId,
+        status: 'playing',
+        updatedAt: Date.now()
+      });
+
+      setOnlineRole(assignedRole);
+      setActiveRoomCode(cleanCode);
+      setGameMode('online');
+      unlockAchievement('ach-online-duel');
+      startNewMatch('online', data.p1PenId, p2PenId, data.deskId, data.ruleMode);
+    } catch (e) {
+      console.error('Firebase room join failed:', e);
+      setOnlineError(
+        'Could not join the online room. Check the room code, your connection, and Firebase security rules.'
+      );
     }
   };
 
